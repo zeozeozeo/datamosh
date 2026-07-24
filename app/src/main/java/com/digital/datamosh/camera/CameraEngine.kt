@@ -9,9 +9,11 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Bundle
 import android.os.Handler
@@ -26,14 +28,20 @@ import java.util.concurrent.atomic.AtomicBoolean
 class CameraEngine(
     private val context: Context,
     private val listener: Listener,
+    initialConfiguration: RecordingConfiguration = RecordingConfiguration(),
+    initialFilterMode: FilterMode = FilterMode.REGULAR,
 ) {
     interface Listener {
         fun onCameraReady(
             front: Boolean,
             torchAvailable: Boolean,
-            supports60Fps: Boolean,
-            activeFps: Int,
+            availableConfigurations: Set<RecordingConfiguration>,
+            activeConfiguration: RecordingConfiguration,
+            invertedFilterAvailable: Boolean,
+            activeFilterMode: FilterMode,
         )
+        fun onConfigurationFallback(configuration: RecordingConfiguration, message: String)
+        fun onFilterFallback(filterMode: FilterMode, message: String)
         fun onSegmentFinished(durationMs: Long?)
         fun onSaved(uri: android.net.Uri)
         fun onWarning(message: String?)
@@ -62,8 +70,14 @@ class CameraEngine(
     private var torchAvailable = false
     private var torchEnabled = false
     private var targetFpsRange: Range<Int>? = null
-    private var targetFps = 30
-    private var supports60Fps = false
+    private var recordingConfiguration = initialConfiguration
+    private var availableConfigurations: Set<RecordingConfiguration> = emptySet()
+    private var filterMode = initialFilterMode
+    private var invertedFilterAvailable = false
+    private var nativeNegativeAvailable = false
+    private var gpuInversionSupported = true
+    private var gpuFilterPipeline: GpuFilterPipeline? = null
+    private var filteredEncoderInputSurface: Surface? = null
     private var sensorOrientation = 90
     private var prepared = false
     private var opening = false
@@ -115,8 +129,11 @@ class CameraEngine(
         if (recordingActive || !prepared || finishing.get()) return
         try {
             if (writer == null) {
-                val orientationHint =
-                    (sensorOrientation - deviceRotationDegrees + 360) % 360
+                val orientationHint = videoOrientationHint(
+                    sensorOrientation,
+                    deviceRotationDegrees,
+                    usingFront,
+                )
                 writer = MuxWriter(context, orientationHint).also { mux ->
                     videoFormat?.let(mux::setVideoFormat)
                     audioEncoder = AudioEncoder(context, mux) {
@@ -189,26 +206,39 @@ class CameraEngine(
     fun switchCamera() {
         if (recordingActive || finishing.get()) return
         usingFront = !usingFront
-        val nextFps = if (targetFps == 60 && !cameraSupportsFps(usingFront, 60)) 30 else targetFps
-        if (nextFps != targetFps) {
-            listener.onWarning("60 fps is unavailable on this lens; switched to 30 fps")
-            reconfigureVideoPipeline(nextFps)
-        } else {
-            closeCamera()
-            cameraHandler.postDelayed({ openCamera() }, 180)
-        }
+        closeCamera()
+        cameraHandler.postDelayed({ openCamera() }, 180)
     }
 
-    fun setTargetFps(fps: Int): Boolean {
-        if (fps !in setOf(30, 60) || recordingActive || writer != null || finishing.get()) {
+    fun setRecordingConfiguration(configuration: RecordingConfiguration): Boolean {
+        if (recordingActive || writer != null || finishing.get()) {
             return false
         }
-        if (fps == 60 && !cameraSupportsFps(usingFront, 60)) {
-            listener.onWarning("60 fps is not exposed for this camera")
+        if (availableConfigurations.isNotEmpty() && configuration !in availableConfigurations) {
+            listener.onWarning("That resolution, frame rate, and codec combination is unavailable")
             return false
         }
-        if (fps == targetFps) return true
-        reconfigureVideoPipeline(fps)
+        if (configuration == recordingConfiguration) return true
+        reconfigureVideoPipeline(configuration)
+        return true
+    }
+
+    fun setFilterMode(mode: FilterMode): Boolean {
+        if (recordingActive || finishing.get()) return false
+        if (mode == FilterMode.INVERTED && !invertedFilterAvailable) {
+            listener.onWarning("The inverted filter is unavailable on this camera")
+            return false
+        }
+        filterMode = mode
+        if (!nativeNegativeAvailable) {
+            closeCamera()
+            cameraHandler.postDelayed({
+                if (mode == FilterMode.REGULAR) releaseGpuFilterPipeline()
+                if (lifecycleActive && !released) openCamera()
+            }, 180)
+        } else {
+            updateRepeatingRequest()
+        }
         return true
     }
 
@@ -239,8 +269,24 @@ class CameraEngine(
                     prepareVideoCodec()
                     prepared = true
                 } catch (error: Throwable) {
-                    listener.onError("H.264 pipeline unavailable: ${error.message}")
-                    return@post
+                    val safe = RecordingConfiguration()
+                    if (recordingConfiguration != safe) {
+                        releaseCodecs()
+                        recordingConfiguration = safe
+                        listener.onConfigurationFallback(
+                            safe,
+                            "Saved recording options are unavailable; using 720p, 30 fps, H.264",
+                        )
+                        runCatching { prepareVideoCodec() }
+                            .onSuccess { prepared = true }
+                            .onFailure {
+                                listener.onError("H.264 pipeline unavailable: ${it.message}")
+                                return@post
+                            }
+                    } else {
+                        listener.onError("H.264 pipeline unavailable: ${error.message}")
+                        return@post
+                    }
                 }
             }
             if (lifecycleActive && !released) cameraHandler.post { openCamera() }
@@ -248,7 +294,11 @@ class CameraEngine(
     }
 
     private fun prepareVideoCodec() {
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val configuration = recordingConfiguration
+        val codecInfo = requireNotNull(findCodecInfo(configuration, encoder = true)) {
+            "No compatible ${configuration.codec.label} encoder"
+        }
+        val codec = MediaCodec.createByCodecName(codecInfo.name)
         encoder = codec
         codec.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(codec: MediaCodec, index: Int) = Unit
@@ -274,10 +324,14 @@ class CameraEngine(
                 maybeCreateDecoder()
             }
         }, codecHandler)
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1280, 720).apply {
+        val format = MediaFormat.createVideoFormat(
+            configuration.codec.mimeType,
+            configuration.resolution.width,
+            configuration.resolution.height,
+        ).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, if (targetFps == 60) 14_000_000 else 8_000_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
+            setInteger(MediaFormat.KEY_BIT_RATE, supportedBitRate(configuration))
+            setInteger(MediaFormat.KEY_FRAME_RATE, configuration.fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 600)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
         }
@@ -366,11 +420,22 @@ class CameraEngine(
         val format = videoFormat ?: return
         val texture = layers?.decodedPreview?.takeIf { it.isAvailable }?.surfaceTexture ?: return
         try {
-            texture.setDefaultBufferSize(1280, 720)
-            layers?.configureTransform(sensorOrientation, usingFront)
+            texture.setDefaultBufferSize(
+                recordingConfiguration.resolution.width,
+                recordingConfiguration.resolution.height,
+            )
+            layers?.configureTransform(
+                sensorOrientation,
+                usingFront,
+                recordingConfiguration.resolution.width,
+                recordingConfiguration.resolution.height,
+            )
             val surface = Surface(texture)
             decoderSurface = surface
-            decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            val decoderInfo = requireNotNull(
+                findCodecInfo(recordingConfiguration, encoder = false),
+            )
+            decoder = MediaCodec.createByCodecName(decoderInfo.name).apply {
                 configure(format, surface, null, 0)
                 start()
             }
@@ -433,14 +498,58 @@ class CameraEngine(
             torchAvailable = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
             sensorOrientation =
                 characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-            layers?.configureTransform(sensorOrientation, usingFront)
+            layers?.configureTransform(
+                sensorOrientation,
+                usingFront,
+                recordingConfiguration.resolution.width,
+                recordingConfiguration.resolution.height,
+            )
+            availableConfigurations = discoverConfigurations(characteristics)
+            if (recordingConfiguration !in availableConfigurations) {
+                val fallback = chooseFallback(recordingConfiguration, availableConfigurations)
+                if (fallback == null) {
+                    listener.onError("This camera has no compatible recording configuration")
+                    return
+                }
+                listener.onConfigurationFallback(
+                    fallback,
+                    "${recordingConfiguration.resolution.label} ${recordingConfiguration.fps} fps " +
+                        "${recordingConfiguration.codec.label} is unavailable on this lens; " +
+                        "using ${fallback.resolution.label} ${fallback.fps} fps ${fallback.codec.label}",
+                )
+                reconfigureVideoPipeline(fallback)
+                return
+            }
+            nativeNegativeAvailable = characteristics
+                .get(CameraCharacteristics.CONTROL_AVAILABLE_EFFECTS)
+                ?.contains(CameraMetadata.CONTROL_EFFECT_MODE_NEGATIVE) == true
+            if (nativeNegativeAvailable) {
+                releaseGpuFilterPipeline()
+            } else if (filterMode == FilterMode.INVERTED) {
+                ensureGpuFilterPipeline()
+            } else {
+                releaseGpuFilterPipeline()
+            }
+            invertedFilterAvailable = nativeNegativeAvailable ||
+                gpuInversionSupported ||
+                filteredEncoderInputSurface != null
+            if (filterMode == FilterMode.INVERTED && !invertedFilterAvailable) {
+                filterMode = FilterMode.REGULAR
+                listener.onFilterFallback(
+                    filterMode,
+                    "The inverted filter is unavailable on this lens; using Regular",
+                )
+            }
+            gpuFilterPipeline?.setInverted(filterMode == FilterMode.INVERTED)
+            layers?.setRawInverted(
+                filterMode == FilterMode.INVERTED && !nativeNegativeAvailable &&
+                    filteredEncoderInputSurface != null,
+            )
+            val targetFps = recordingConfiguration.fps
             targetFpsRange = characteristics
                 .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
                 ?.filter { it.lower <= targetFps && it.upper >= targetFps }
                 ?.minByOrNull { (it.upper - it.lower) * 100 + it.upper }
-            supports60Fps = characteristics
-                .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                ?.any { it.lower <= 60 && it.upper >= 60 } == true
             opening = true
             cameraManager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
@@ -489,15 +598,31 @@ class CameraEngine(
 
     private fun createSession(device: CameraDevice) {
         val texture = layers?.rawPreview?.surfaceTexture ?: return
-        texture.setDefaultBufferSize(1280, 720)
-        layers?.configureTransform(sensorOrientation, usingFront)
+        texture.setDefaultBufferSize(
+            recordingConfiguration.resolution.width,
+            recordingConfiguration.resolution.height,
+        )
+        layers?.configureTransform(
+            sensorOrientation,
+            usingFront,
+            recordingConfiguration.resolution.width,
+            recordingConfiguration.resolution.height,
+        )
         val previewSurface = Surface(texture)
-        val codecSurface = encoderSurface ?: return
+        val codecSurface = filteredEncoderInputSurface ?: encoderSurface ?: return
         try {
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(previewSurface)
                 addTarget(codecSurface)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                set(
+                    CaptureRequest.CONTROL_EFFECT_MODE,
+                    if (filterMode == FilterMode.INVERTED && nativeNegativeAvailable) {
+                        CameraMetadata.CONTROL_EFFECT_MODE_NEGATIVE
+                    } else {
+                        CameraMetadata.CONTROL_EFFECT_MODE_OFF
+                    },
+                )
                 targetFpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
             }
             requestBuilder = builder
@@ -511,17 +636,23 @@ class CameraEngine(
                         listener.onCameraReady(
                             usingFront,
                             torchAvailable,
-                            supports60Fps,
-                            targetFps,
+                            availableConfigurations,
+                            recordingConfiguration,
+                            invertedFilterAvailable,
+                            filterMode,
                         )
                     }
 
                     override fun onConfigureFailed(captureSession: CameraCaptureSession) {
-                        if (targetFps == 60) {
-                            listener.onWarning("60 fps session failed; falling back to 30 fps")
-                            reconfigureVideoPipeline(30)
+                        if (recordingConfiguration != RecordingConfiguration()) {
+                            val safe = RecordingConfiguration()
+                            listener.onConfigurationFallback(
+                                safe,
+                                "Recording session failed; using 720p, 30 fps, H.264",
+                            )
+                            reconfigureVideoPipeline(safe)
                         } else {
-                            listener.onError("Camera cannot stream to the H.264 encoder")
+                            listener.onError("Camera cannot stream to the video encoder")
                         }
                     }
                 },
@@ -543,6 +674,14 @@ class CameraEngine(
                     CaptureRequest.FLASH_MODE_OFF
                 },
             )
+            builder.set(
+                CaptureRequest.CONTROL_EFFECT_MODE,
+                if (filterMode == FilterMode.INVERTED && nativeNegativeAvailable) {
+                    CameraMetadata.CONTROL_EFFECT_MODE_NEGATIVE
+                } else {
+                    CameraMetadata.CONTROL_EFFECT_MODE_OFF
+                },
+            )
             runCatching { session?.setRepeatingRequest(builder.build(), null, cameraHandler) }
                 .onFailure { listener.onWarning("Camera controls are temporarily unavailable") }
         }
@@ -560,8 +699,8 @@ class CameraEngine(
         }
     }
 
-    private fun reconfigureVideoPipeline(fps: Int) {
-        targetFps = fps
+    private fun reconfigureVideoPipeline(configuration: RecordingConfiguration) {
+        recordingConfiguration = configuration
         closeCamera()
         codecHandler.postDelayed({
             releaseCodecs()
@@ -571,37 +710,124 @@ class CameraEngine(
                 if (lifecycleActive && !released) cameraHandler.post { openCamera() }
             } catch (error: Throwable) {
                 releaseCodecs()
-                if (fps == 60) {
-                    listener.onWarning("The H.264 encoder rejected 60 fps; using 30 fps")
-                    targetFps = 30
+                val safe = RecordingConfiguration()
+                if (configuration != safe) {
+                    recordingConfiguration = safe
+                    listener.onConfigurationFallback(
+                        safe,
+                        "The selected recording options failed; using 720p, 30 fps, H.264",
+                    )
                     runCatching {
                         prepareVideoCodec()
                         prepared = true
                         if (lifecycleActive && !released) cameraHandler.post { openCamera() }
                     }.onFailure {
-                        listener.onError("Could not restore 30 fps: ${it.message}")
+                        listener.onError("Could not restore safe recording options: ${it.message}")
                     }
                 } else {
-                    listener.onError("Could not configure $fps fps: ${error.message}")
+                    listener.onError("Could not configure the video pipeline: ${error.message}")
                 }
             }
         }, 260)
     }
 
-    private fun cameraSupportsFps(front: Boolean, fps: Int): Boolean = runCatching {
-        val facing = if (front) {
-            CameraCharacteristics.LENS_FACING_FRONT
+    private fun discoverConfigurations(
+        characteristics: CameraCharacteristics,
+    ): Set<RecordingConfiguration> {
+        val streamMap = characteristics
+            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return emptySet()
+        val previewSizes =
+            streamMap.getOutputSizes(SurfaceTexture::class.java)?.toSet().orEmpty()
+        val encoderSizes = runCatching {
+            streamMap.getOutputSizes(MediaCodec::class.java)?.toSet().orEmpty()
+        }.getOrDefault(emptySet())
+        val outputSizes = if (encoderSizes.isEmpty()) {
+            previewSizes
         } else {
-            CameraCharacteristics.LENS_FACING_BACK
+            previewSizes intersect encoderSizes
         }
-        val id = cameraManager.cameraIdList.firstOrNull {
-            cameraManager.getCameraCharacteristics(it)
-                .get(CameraCharacteristics.LENS_FACING) == facing
-        } ?: return@runCatching false
-        cameraManager.getCameraCharacteristics(id)
+        val fpsRanges = characteristics
             .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-            ?.any { it.lower <= fps && it.upper >= fps } == true
-    }.getOrDefault(false)
+            .orEmpty()
+        return buildSet {
+            VideoResolution.entries.forEach { resolution ->
+                val size = android.util.Size(resolution.width, resolution.height)
+                if (size !in outputSizes) return@forEach
+                listOf(30, 60).forEach { fps ->
+                    val frameDuration = runCatching {
+                        streamMap.getOutputMinFrameDuration(SurfaceTexture::class.java, size)
+                    }.getOrDefault(0L)
+                    val cameraCanRunRate =
+                        fpsRanges.any { it.lower <= fps && it.upper >= fps } &&
+                            (frameDuration <= 0L || frameDuration <= 1_000_000_000L / fps)
+                    if (!cameraCanRunRate) return@forEach
+                    VideoCodec.entries.forEach { codec ->
+                        val configuration = RecordingConfiguration(resolution, fps, codec)
+                        if (
+                            codecSupports(configuration, encoder = true) &&
+                            codecSupports(configuration, encoder = false)
+                        ) {
+                            add(configuration)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun codecSupports(
+        configuration: RecordingConfiguration,
+        encoder: Boolean,
+    ): Boolean = findCodecInfo(configuration, encoder) != null
+
+    private fun findCodecInfo(
+        configuration: RecordingConfiguration,
+        encoder: Boolean,
+    ): android.media.MediaCodecInfo? =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
+        info.isEncoder == encoder &&
+            info.supportedTypes.any { it.equals(configuration.codec.mimeType, ignoreCase = true) } &&
+            runCatching {
+                val capabilities = info.getCapabilitiesForType(configuration.codec.mimeType)
+                (!encoder || capabilities.colorFormats.contains(
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+                )) && capabilities.videoCapabilities?.areSizeAndRateSupported(
+                    configuration.resolution.width,
+                    configuration.resolution.height,
+                    configuration.fps.toDouble(),
+                ) == true
+            }.getOrDefault(false)
+        }
+
+    private fun supportedBitRate(configuration: RecordingConfiguration): Int {
+        val range = findCodecInfo(configuration, encoder = true)
+            ?.let { info ->
+                runCatching {
+                    info.getCapabilitiesForType(configuration.codec.mimeType)
+                        .videoCapabilities?.bitrateRange
+                }.getOrNull()
+            } ?: return configuration.bitRate
+        return configuration.bitRate.coerceIn(range.lower, range.upper)
+    }
+
+    private fun chooseFallback(
+        requested: RecordingConfiguration,
+        available: Set<RecordingConfiguration>,
+    ): RecordingConfiguration? {
+        val candidates = listOf(
+            requested.copy(fps = 30),
+            requested.copy(resolution = VideoResolution.HD_720P),
+            requested.copy(resolution = VideoResolution.HD_720P, fps = 30),
+            requested.copy(codec = VideoCodec.AVC),
+            requested.copy(fps = 30, codec = VideoCodec.AVC),
+            requested.copy(
+                resolution = VideoResolution.HD_720P,
+                fps = 30,
+                codec = VideoCodec.AVC,
+            ),
+        )
+        return candidates.firstOrNull { it in available } ?: available.firstOrNull()
+    }
 
     private fun finalizeWriter() {
         if (!finalized.compareAndSet(false, true)) return
@@ -622,11 +848,38 @@ class CameraEngine(
 
     private fun releaseCodecs() {
         releaseDecoder()
+        releaseGpuFilterPipeline()
         runCatching { encoder?.stop() }
         runCatching { encoder?.release() }
         runCatching { encoderSurface?.release() }
         encoder = null
         encoderSurface = null
         prepared = false
+    }
+
+    private fun ensureGpuFilterPipeline() {
+        if (filteredEncoderInputSurface != null) return
+        val output = encoderSurface ?: return
+        val pipeline = GpuFilterPipeline(listener::onWarning)
+        val input = pipeline.prepare(
+            output,
+            recordingConfiguration.resolution.width,
+            recordingConfiguration.resolution.height,
+        )
+        if (input == null) {
+            gpuInversionSupported = false
+            pipeline.release()
+            return
+        }
+        gpuInversionSupported = true
+        gpuFilterPipeline = pipeline
+        filteredEncoderInputSurface = input
+    }
+
+    private fun releaseGpuFilterPipeline() {
+        filteredEncoderInputSurface = null
+        gpuFilterPipeline?.release()
+        gpuFilterPipeline = null
+        layers?.setRawInverted(false)
     }
 }

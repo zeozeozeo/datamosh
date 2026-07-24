@@ -2,9 +2,13 @@ package com.digital.datamosh.camera
 
 import android.content.Context
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.view.Surface
 import android.view.TextureView
+import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 
@@ -17,6 +21,8 @@ class PreviewLayers(context: Context) : FrameLayout(context) {
     val decodedPreview = TextureView(context)
     private var sensorOrientation = 90
     private var mirrorDecoded = false
+    private var bufferWidth = 1280f
+    private var bufferHeight = 720f
 
     init {
         setBackgroundColor(Color.BLACK)
@@ -40,9 +46,37 @@ class PreviewLayers(context: Context) : FrameLayout(context) {
             .start()
     }
 
-    fun configureTransform(sensorOrientation: Int, mirrorDecoded: Boolean) {
+    fun setRawInverted(inverted: Boolean) {
+        post {
+            if (inverted) {
+                val matrix = ColorMatrix(
+                    floatArrayOf(
+                        -1f, 0f, 0f, 0f, 255f,
+                        0f, -1f, 0f, 0f, 255f,
+                        0f, 0f, -1f, 0f, 255f,
+                        0f, 0f, 0f, 1f, 0f,
+                    ),
+                )
+                rawPreview.setLayerType(
+                    View.LAYER_TYPE_HARDWARE,
+                    Paint().apply { colorFilter = ColorMatrixColorFilter(matrix) },
+                )
+            } else {
+                rawPreview.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            }
+        }
+    }
+
+    fun configureTransform(
+        sensorOrientation: Int,
+        mirrorDecoded: Boolean,
+        bufferWidth: Int,
+        bufferHeight: Int,
+    ) {
         this.sensorOrientation = sensorOrientation
         this.mirrorDecoded = mirrorDecoded
+        this.bufferWidth = bufferWidth.toFloat()
+        this.bufferHeight = bufferHeight.toFloat()
         post(::applyTransform)
     }
 
@@ -68,8 +102,8 @@ class PreviewLayers(context: Context) : FrameLayout(context) {
         val matrix = centerCropMatrix(
             viewWidth = viewWidth,
             viewHeight = viewHeight,
-            bufferWidth = 1280f,
-            bufferHeight = 720f,
+            bufferWidth = bufferWidth,
+            bufferHeight = bufferHeight,
             rotation = rotation,
         )
         // Camera2's SurfaceTexture already carries the camera producer's sensor rotation.

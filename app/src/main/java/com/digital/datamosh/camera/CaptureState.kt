@@ -4,6 +4,50 @@ import android.net.Uri
 
 enum class SegmentMode { CLEAN, MOSH }
 
+enum class VideoResolution(
+    val width: Int,
+    val height: Int,
+    val label: String,
+) {
+    HD_720P(1280, 720, "720p"),
+    FULL_HD_1080P(1920, 1080, "1080p"),
+}
+
+enum class VideoCodec(
+    val mimeType: String,
+    val label: String,
+) {
+    AVC("video/avc", "H.264"),
+    HEVC("video/hevc", "H.265 / HEVC"),
+}
+
+enum class FilterMode { REGULAR, INVERTED }
+
+data class RecordingConfiguration(
+    val resolution: VideoResolution = VideoResolution.HD_720P,
+    val fps: Int = 30,
+    val codec: VideoCodec = VideoCodec.AVC,
+) {
+    val bitRate: Int
+        get() = when (resolution) {
+            VideoResolution.HD_720P -> if (fps == 60) 14_000_000 else 8_000_000
+            VideoResolution.FULL_HD_1080P -> if (fps == 60) 20_000_000 else 12_000_000
+        }
+}
+
+internal fun videoOrientationHint(
+    sensorOrientation: Int,
+    deviceOrientation: Int,
+    frontFacing: Boolean,
+): Int = if (frontFacing) {
+    (sensorOrientation + deviceOrientation) % 360
+} else {
+    (sensorOrientation - deviceOrientation + 360) % 360
+}
+
+internal fun clockwiseDeviceOrientation(sensorDegrees: Int): Int =
+    (360 - sensorDegrees) % 360
+
 enum class CapturePhase {
     PREPARING,
     READY,
@@ -22,8 +66,10 @@ data class CameraUiState(
     val usingFrontCamera: Boolean = false,
     val torchEnabled: Boolean = false,
     val torchAvailable: Boolean = false,
-    val targetFps: Int = 30,
-    val supports60Fps: Boolean = false,
+    val recordingConfiguration: RecordingConfiguration = RecordingConfiguration(),
+    val availableConfigurations: Set<RecordingConfiguration> = emptySet(),
+    val filterMode: FilterMode = FilterMode.REGULAR,
+    val invertedFilterAvailable: Boolean = false,
     val cameraReady: Boolean = false,
     val warning: String? = null,
     val error: String? = null,
@@ -33,8 +79,9 @@ data class CameraUiState(
     val canHold: Boolean get() = cameraReady && phase in setOf(CapturePhase.READY, CapturePhase.PAUSED)
     val canReset: Boolean get() = phase == CapturePhase.PAUSED && nextMode == SegmentMode.MOSH
     val canFinish: Boolean get() = phase == CapturePhase.PAUSED && segmentCount > 0
-    val canChangeFps: Boolean
+    val canChangeRecordingSettings: Boolean
         get() = cameraReady && phase == CapturePhase.READY && segmentCount == 0
+    val targetFps: Int get() = recordingConfiguration.fps
 }
 
 sealed interface CaptureAction {
@@ -117,5 +164,9 @@ fun reduceCaptureState(state: CameraUiState, action: CaptureAction): CameraUiSta
         cameraReady = state.cameraReady,
         usingFrontCamera = state.usingFrontCamera,
         torchAvailable = state.torchAvailable,
+        recordingConfiguration = state.recordingConfiguration,
+        availableConfigurations = state.availableConfigurations,
+        filterMode = state.filterMode,
+        invertedFilterAvailable = state.invertedFilterAvailable,
     )
 }

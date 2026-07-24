@@ -3,10 +3,16 @@ package com.digital.datamosh
 import com.digital.datamosh.camera.CameraUiState
 import com.digital.datamosh.camera.CaptureAction
 import com.digital.datamosh.camera.CapturePhase
+import com.digital.datamosh.camera.FilterMode
 import com.digital.datamosh.camera.KeyframeGate
 import com.digital.datamosh.camera.SampleDecision
 import com.digital.datamosh.camera.SegmentMode
+import com.digital.datamosh.camera.RecordingConfiguration
+import com.digital.datamosh.camera.VideoCodec
+import com.digital.datamosh.camera.VideoResolution
 import com.digital.datamosh.camera.reduceCaptureState
+import com.digital.datamosh.camera.videoOrientationHint
+import com.digital.datamosh.camera.clockwiseDeviceOrientation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -86,10 +92,63 @@ class CaptureStateTest {
         val ready = CameraUiState(
             phase = CapturePhase.READY,
             cameraReady = true,
-            supports60Fps = true,
         )
-        assertTrue(ready.canChangeFps)
-        assertFalse(ready.copy(phase = CapturePhase.HOLDING).canChangeFps)
-        assertFalse(ready.copy(phase = CapturePhase.PAUSED, segmentCount = 1).canChangeFps)
+        assertTrue(ready.canChangeRecordingSettings)
+        assertFalse(ready.copy(phase = CapturePhase.HOLDING).canChangeRecordingSettings)
+        assertFalse(
+            ready.copy(
+                phase = CapturePhase.PAUSED,
+                segmentCount = 1,
+            ).canChangeRecordingSettings,
+        )
+    }
+
+    @Test
+    fun recordingConfigurationUsesResolutionAndFrameRateBitrates() {
+        assertEquals(
+            8_000_000,
+            RecordingConfiguration(VideoResolution.HD_720P, 30, VideoCodec.AVC).bitRate,
+        )
+        assertEquals(
+            20_000_000,
+            RecordingConfiguration(VideoResolution.FULL_HD_1080P, 60, VideoCodec.HEVC).bitRate,
+        )
+    }
+
+    @Test
+    fun newTakePreservesRecordingPreferencesAndCapabilities() {
+        val configuration = RecordingConfiguration(
+            VideoResolution.FULL_HD_1080P,
+            30,
+            VideoCodec.HEVC,
+        )
+        val available = setOf(configuration)
+        val state = CameraUiState(
+            phase = CapturePhase.PAUSED,
+            cameraReady = true,
+            segmentCount = 2,
+            recordingConfiguration = configuration,
+            availableConfigurations = available,
+            filterMode = FilterMode.INVERTED,
+            invertedFilterAvailable = true,
+        )
+
+        val next = reduceCaptureState(state, CaptureAction.NewTake)
+
+        assertEquals(CapturePhase.READY, next.phase)
+        assertEquals(configuration, next.recordingConfiguration)
+        assertEquals(available, next.availableConfigurations)
+        assertEquals(FilterMode.INVERTED, next.filterMode)
+        assertTrue(next.invertedFilterAvailable)
+    }
+
+    @Test
+    fun videoOrientationUsesPhysicalDeviceRotation() {
+        assertEquals(90, videoOrientationHint(90, 0, frontFacing = false))
+        assertEquals(0, videoOrientationHint(90, 90, frontFacing = false))
+        assertEquals(180, videoOrientationHint(90, 270, frontFacing = false))
+        assertEquals(180, videoOrientationHint(90, 90, frontFacing = true))
+        assertEquals(270, clockwiseDeviceOrientation(90))
+        assertEquals(90, clockwiseDeviceOrientation(270))
     }
 }

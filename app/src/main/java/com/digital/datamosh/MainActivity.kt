@@ -10,8 +10,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.view.OrientationEventListener
 import android.view.ViewGroup
 import android.widget.VideoView
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -22,6 +24,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
@@ -40,7 +43,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -49,7 +55,9 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -64,6 +72,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Cameraswitch
 import androidx.compose.material.icons.rounded.Check
@@ -71,7 +80,9 @@ import androidx.compose.material.icons.rounded.FlashOff
 import androidx.compose.material.icons.rounded.FlashOn
 import androidx.compose.material.icons.rounded.GridOff
 import androidx.compose.material.icons.rounded.GridOn
+import androidx.compose.material.icons.rounded.InvertColors
 import androidx.compose.material.icons.rounded.RestartAlt
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
@@ -81,6 +92,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -95,8 +107,13 @@ import com.digital.datamosh.camera.CameraEngine
 import com.digital.datamosh.camera.CameraUiState
 import com.digital.datamosh.camera.CaptureAction
 import com.digital.datamosh.camera.CapturePhase
+import com.digital.datamosh.camera.FilterMode
 import com.digital.datamosh.camera.PreviewLayers
+import com.digital.datamosh.camera.RecordingConfiguration
 import com.digital.datamosh.camera.SegmentMode
+import com.digital.datamosh.camera.VideoCodec
+import com.digital.datamosh.camera.VideoResolution
+import com.digital.datamosh.camera.clockwiseDeviceOrientation
 import com.digital.datamosh.camera.reduceCaptureState
 import com.digital.datamosh.ui.theme.DatamoshTheme
 import kotlinx.coroutines.delay
@@ -139,16 +156,41 @@ private class CameraController(
     private val activity: Activity,
 ) : CameraEngine.Listener {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val mutableState = MutableStateFlow(CameraUiState())
+    private val preferences = RecordingPreferences(activity)
+    private val mutableState = MutableStateFlow(
+        CameraUiState(
+            recordingConfiguration = preferences.loadConfiguration(),
+            filterMode = preferences.loadFilter(),
+        ),
+    )
     val state: StateFlow<CameraUiState> = mutableState.asStateFlow()
     private var engine: CameraEngine? = null
     private var layers: PreviewLayers? = null
     private var torch = false
+    @Volatile private var deviceOrientationDegrees = 0
+    private val orientationListener = object : OrientationEventListener(activity) {
+        override fun onOrientationChanged(orientation: Int) {
+            if (orientation == ORIENTATION_UNKNOWN) return
+            val sensorDegrees = ((orientation + 45) / 90 * 90) % 360
+            // OrientationEventListener increases counter-clockwise from portrait, while camera
+            // orientation hints use the display's clockwise rotation convention.
+            deviceOrientationDegrees = clockwiseDeviceOrientation(sensorDegrees)
+        }
+    }
+
+    init {
+        orientationListener.enable()
+    }
 
     fun attach(newLayers: PreviewLayers) {
         layers = newLayers
         if (engine == null) {
-            engine = CameraEngine(activity, this).also { it.attach(newLayers) }
+            engine = CameraEngine(
+                activity,
+                this,
+                mutableState.value.recordingConfiguration,
+                mutableState.value.filterMode,
+            ).also { it.attach(newLayers) }
         }
     }
 
@@ -156,15 +198,7 @@ private class CameraController(
         val current = mutableState.value
         if (!current.canHold) return
         dispatch(CaptureAction.HoldStarted)
-        @Suppress("DEPRECATION")
-        val rotation = activity.windowManager.defaultDisplay.rotation
-        val deviceRotationDegrees = when (rotation) {
-            android.view.Surface.ROTATION_90 -> 90
-            android.view.Surface.ROTATION_180 -> 180
-            android.view.Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-        engine?.startSegment(current.nextMode, deviceRotationDegrees)
+        engine?.startSegment(current.nextMode, deviceOrientationDegrees)
     }
 
     fun holdEnd() {
@@ -184,18 +218,31 @@ private class CameraController(
         engine?.switchCamera()
     }
 
-    fun toggleFps() {
+    fun setRecordingConfiguration(configuration: RecordingConfiguration) {
         val current = mutableState.value
-        if (!current.canChangeFps) return
-        val requested = if (current.targetFps == 30) 60 else 30
-        if (requested == 60 && !current.supports60Fps) return
-        if (engine?.setTargetFps(requested) == true) {
+        if (!current.canChangeRecordingSettings) return
+        if (engine?.setRecordingConfiguration(configuration) == true) {
+            preferences.saveConfiguration(configuration)
             mutableState.value = current.copy(
                 phase = CapturePhase.PREPARING,
                 cameraReady = false,
-                targetFps = requested,
+                recordingConfiguration = configuration,
                 warning = null,
             )
+        }
+    }
+
+    fun toggleFilter() {
+        val current = mutableState.value
+        if (current.isHolding || current.phase == CapturePhase.FINALIZING) return
+        val requested = if (current.filterMode == FilterMode.REGULAR) {
+            FilterMode.INVERTED
+        } else {
+            FilterMode.REGULAR
+        }
+        if (engine?.setFilterMode(requested) == true) {
+            preferences.saveFilter(requested)
+            mutableState.value = current.copy(filterMode = requested, warning = null)
         }
     }
 
@@ -226,14 +273,17 @@ private class CameraController(
     }
 
     fun pauseForLifecycle() {
+        orientationListener.disable()
         engine?.pauseForLifecycle()
     }
 
     fun resumeForLifecycle() {
+        orientationListener.enable()
         engine?.resumeForLifecycle()
     }
 
     fun release(abandon: Boolean) {
+        orientationListener.disable()
         engine?.release(abandon && mutableState.value.savedUri == null)
         engine = null
     }
@@ -241,17 +291,37 @@ private class CameraController(
     override fun onCameraReady(
         front: Boolean,
         torchAvailable: Boolean,
-        supports60Fps: Boolean,
-        activeFps: Int,
+        availableConfigurations: Set<RecordingConfiguration>,
+        activeConfiguration: RecordingConfiguration,
+        invertedFilterAvailable: Boolean,
+        activeFilterMode: FilterMode,
     ) = onMain {
         dispatch(CaptureAction.CameraReady)
         mutableState.value = mutableState.value.copy(
             usingFrontCamera = front,
             torchAvailable = torchAvailable,
             torchEnabled = false,
-            supports60Fps = supports60Fps,
-            targetFps = activeFps,
+            availableConfigurations = availableConfigurations,
+            recordingConfiguration = activeConfiguration,
+            invertedFilterAvailable = invertedFilterAvailable,
+            filterMode = activeFilterMode,
         )
+    }
+
+    override fun onConfigurationFallback(
+        configuration: RecordingConfiguration,
+        message: String,
+    ) = onMain {
+        preferences.saveConfiguration(configuration)
+        mutableState.value = mutableState.value.copy(
+            recordingConfiguration = configuration,
+            warning = message,
+        )
+    }
+
+    override fun onFilterFallback(filterMode: FilterMode, message: String) = onMain {
+        preferences.saveFilter(filterMode)
+        mutableState.value = mutableState.value.copy(filterMode = filterMode, warning = message)
     }
 
     override fun onSegmentFinished(durationMs: Long?) = onMain {
@@ -321,9 +391,27 @@ private fun DatamoshApp(controller: CameraController) {
     }
 
     val state by controller.state.collectAsStateWithLifecycle()
+    var showOptions by remember { mutableStateOf(false) }
+    LaunchedEffect(state.savedUri) {
+        if (state.savedUri != null) showOptions = false
+    }
+    BackHandler(enabled = showOptions) { showOptions = false }
     AnimatedContent(targetState = state.savedUri, label = "camera-result") { uri ->
         if (uri == null) {
-            CameraScreen(state, controller)
+            Box(Modifier.fillMaxSize()) {
+                CameraScreen(
+                    state = state,
+                    controller = controller,
+                    onOpenOptions = { showOptions = true },
+                )
+                if (showOptions) {
+                    OptionsScreen(
+                        state = state,
+                        onBack = { showOptions = false },
+                        onConfigurationChange = controller::setRecordingConfiguration,
+                    )
+                }
+            }
         } else {
             ResultScreen(
                 uri = uri,
@@ -352,7 +440,12 @@ private fun PermissionScreen(onGrant: () -> Unit, onSettings: () -> Unit) {
                 color = MaterialTheme.colorScheme.primaryContainer,
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Text("M", fontSize = 42.sp, fontWeight = FontWeight.Black)
+                    Icon(
+                        painter = painterResource(R.drawable.ic_launcher_monochrome),
+                        contentDescription = "Datamosh logo",
+                        modifier = Modifier.size(76.dp),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
                 }
             }
             Spacer(Modifier.height(28.dp))
@@ -372,7 +465,11 @@ private fun PermissionScreen(onGrant: () -> Unit, onSettings: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CameraScreen(state: CameraUiState, controller: CameraController) {
+private fun CameraScreen(
+    state: CameraUiState,
+    controller: CameraController,
+    onOpenOptions: () -> Unit,
+) {
     val haptics = LocalHapticFeedback.current
     var gridEnabled by remember { mutableStateOf(false) }
     var elapsedDuringHold by remember { mutableLongStateOf(0L) }
@@ -495,13 +592,44 @@ private fun CameraScreen(state: CameraUiState, controller: CameraController) {
                 selected = gridEnabled,
                 onClick = { gridEnabled = !gridEnabled },
             )
-            FpsButton(
-                fps = state.targetFps,
-                enabled = state.canChangeFps && (state.targetFps == 60 || state.supports60Fps),
-                onClick = controller::toggleFps,
+            CameraIconButton(
+                icon = Icons.Rounded.InvertColors,
+                description = if (state.invertedFilterAvailable) {
+                    "Toggle inverted filter"
+                } else {
+                    "Inverted filter unavailable on this camera"
+                },
+                enabled = state.invertedFilterAvailable &&
+                    !state.isHolding &&
+                    state.phase != CapturePhase.FINALIZING,
+                selected = state.filterMode == FilterMode.INVERTED,
+                onClick = controller::toggleFilter,
             )
+            CameraIconButton(
+                icon = Icons.Rounded.Settings,
+                description = "Recording options",
+                enabled = !state.isHolding && state.phase != CapturePhase.FINALIZING,
+                onClick = onOpenOptions,
+            )
+            CameraIconButton(
+                icon = Icons.Rounded.Cameraswitch,
+                description = "Switch camera",
+                enabled = !state.isHolding && state.phase != CapturePhase.FINALIZING,
+                onClick = controller::switchCamera,
+            )
+        }
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 70.dp),
+            color = Color.Black.copy(alpha = 0.58f),
+            contentColor = Color.White,
+            shape = RoundedCornerShape(18.dp),
+        ) {
             Row(
-                modifier = Modifier.size(width = 78.dp, height = 48.dp),
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -515,52 +643,189 @@ private fun CameraScreen(state: CameraUiState, controller: CameraController) {
                     Spacer(Modifier.size(6.dp))
                 }
                 Text(
-                    formatDuration(shownDuration),
-                    color = Color.White,
+                    "${formatDuration(shownDuration)}  ·  " +
+                        "${state.recordingConfiguration.resolution.label}  " +
+                        "${state.targetFps} fps",
                     fontWeight = FontWeight.Medium,
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
                 )
             }
-            CameraIconButton(
-                icon = Icons.Rounded.Cameraswitch,
-                description = "Switch camera",
-                enabled = !state.isHolding && state.phase != CapturePhase.FINALIZING,
-                onClick = controller::switchCamera,
-            )
         }
-
     }
 }
 
 @Composable
-private fun FpsButton(
-    fps: Int,
+private fun OptionsScreen(
+    state: CameraUiState,
+    onBack: () -> Unit,
+    onConfigurationChange: (RecordingConfiguration) -> Unit,
+) {
+    val current = state.recordingConfiguration
+    val unlocked = state.canChangeRecordingSettings
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(64.dp)
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back to camera")
+                }
+                Text(
+                    "Recording options",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            HorizontalDivider()
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 18.dp),
+            ) {
+                if (!unlocked) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        shape = RoundedCornerShape(16.dp),
+                    ) {
+                        Text(
+                            "Start a new take to change resolution, frame rate, or codec.",
+                            modifier = Modifier.padding(16.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    Spacer(Modifier.height(20.dp))
+                }
+
+                OptionsHeading("Resolution")
+                VideoResolution.entries.forEach { resolution ->
+                    val candidate = current.copy(resolution = resolution)
+                    val supported = candidate in state.availableConfigurations
+                    RecordingOption(
+                        title = resolution.label,
+                        subtitle = when {
+                            !unlocked -> null
+                            supported -> if (resolution == VideoResolution.FULL_HD_1080P) {
+                                "Sharper video with higher processing cost"
+                            } else {
+                                "Best compatibility and classic datamosh texture"
+                            }
+                            else -> "Unavailable with the selected frame rate and codec"
+                        },
+                        selected = current.resolution == resolution,
+                        enabled = unlocked && supported,
+                        onClick = { onConfigurationChange(candidate) },
+                    )
+                }
+
+                Spacer(Modifier.height(18.dp))
+                OptionsHeading("Frame rate")
+                listOf(30, 60).forEach { fps ->
+                    val candidate = current.copy(fps = fps)
+                    val supported = candidate in state.availableConfigurations
+                    RecordingOption(
+                        title = "$fps fps",
+                        subtitle = when {
+                            !unlocked -> null
+                            supported && fps == 60 -> "Smoother motion and denser glitch movement"
+                            supported -> "Best compatibility"
+                            else -> "Unavailable at the selected resolution and codec"
+                        },
+                        selected = current.fps == fps,
+                        enabled = unlocked && supported,
+                        onClick = { onConfigurationChange(candidate) },
+                    )
+                }
+
+                Spacer(Modifier.height(18.dp))
+                OptionsHeading("Codec")
+                VideoCodec.entries.forEach { codec ->
+                    val candidate = current.copy(codec = codec)
+                    val supported = candidate in state.availableConfigurations
+                    RecordingOption(
+                        title = codec.label,
+                        subtitle = when {
+                            !unlocked -> null
+                            codec == VideoCodec.HEVC && supported ->
+                                "Experimental — artifacts and playback vary by device"
+                            codec == VideoCodec.HEVC ->
+                                "Unavailable for the selected resolution and frame rate"
+                            supported -> "Most compatible"
+                            else -> "Unavailable on this device"
+                        },
+                        selected = current.codec == codec,
+                        enabled = unlocked && supported,
+                        onClick = { onConfigurationChange(candidate) },
+                    )
+                }
+                Spacer(Modifier.height(28.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun OptionsHeading(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleMedium,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+    )
+}
+
+@Composable
+private fun RecordingOption(
+    title: String,
+    subtitle: String?,
+    selected: Boolean,
     enabled: Boolean,
     onClick: () -> Unit,
 ) {
-    IconButton(
-        onClick = onClick,
-        enabled = enabled,
+    Row(
         modifier = Modifier
-            .size(52.dp)
-            .semantics {
-                contentDescription = if (enabled) {
-                    "Recording frame rate: $fps fps. Tap to change"
-                } else {
-                    "Recording frame rate: $fps fps"
-                }
-            },
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            fps.toString(),
-            color = when {
-                !enabled -> Color.White.copy(alpha = 0.34f)
-                fps == 60 -> MaterialTheme.colorScheme.secondary
-                else -> Color.White
-            },
-            fontWeight = FontWeight.Bold,
-            fontSize = 16.sp,
-        )
+        RadioButton(selected = selected, onClick = null, enabled = enabled)
+        Spacer(Modifier.width(10.dp))
+        Column {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (enabled || selected) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f)
+                },
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            )
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                        alpha = if (enabled) 1f else 0.55f,
+                    ),
+                )
+            }
+        }
     }
 }
 
