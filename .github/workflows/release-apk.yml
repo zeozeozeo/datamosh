@@ -41,7 +41,7 @@ jobs:
       # apksigner from build-tools 35+ cannot currently be verified by
       # F-Droid's reproducible-build signature copier. Keep this pinned.
       - name: Install reproducible signing tools
-        run: sdkmanager "build-tools;34.0.0"
+        run: "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0"
 
       - name: Validate signing secrets
         env:
