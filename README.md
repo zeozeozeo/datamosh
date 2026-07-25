@@ -1,5 +1,12 @@
 # Datamosh
 
+<div>
+<a href="https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/https://github.com/zeozeozeo/datamosh">
+<img src="https://github.com/ImranR98/Obtainium/blob/main/assets/graphics/badge_obtainium.png"
+alt="Get it on Obtainium" align="center" height="80" />
+</a>
+</div
+
 An Android app for Live Datamoshing
 
 Datamosh records one take as a sequence of segments. Continue the take in
