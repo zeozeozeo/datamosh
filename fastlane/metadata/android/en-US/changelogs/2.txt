@@ -1,0 +1,4 @@
+Inversion filter
+Add experimental H.265 encoder for datamoshing
+Add 1080p resolution
+Fix orientation when exporting video

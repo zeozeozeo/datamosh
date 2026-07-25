@@ -1,0 +1,12 @@
+Datamosh is a camera for creating live datamoshed video.
+
+Record a take as a sequence of hold-to-record segments. Add datamosh segments to
+carry motion from earlier footage into the next segment, or add a clean segment
+to reset the effect. Choose the resolution, frame rate, and supported video
+codec before beginning a take, and optionally use the inverted preview filter.
+
+Finished videos are saved to the Movies/Datamosh folder in your device gallery.
+They can be previewed, shared, or deleted from the app.
+
+Datamosh uses the camera and microphone only while recording. It has no account,
+advertising, analytics, or network features; recordings remain on your device.
